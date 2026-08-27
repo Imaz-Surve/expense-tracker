@@ -27,8 +27,8 @@ public class Transaction {
     @Column(name = "transaction_date", nullable = false)
     private LocalDate transactionDate;
 
-    @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "category_id")
     private Category category;
 
     @Enumerated(EnumType.STRING)
@@ -55,19 +55,6 @@ public class Transaction {
     @PrePersist
     protected void onCreate() {
         createdAt = LocalDateTime.now();
-    }
-
-    public enum Category {
-        FOOD_AND_DINING,
-        TRANSPORT,
-        SHOPPING,
-        UTILITIES,
-        HEALTH,
-        ENTERTAINMENT,
-        TRAVEL,
-        EDUCATION,
-        GROCERIES,
-        OTHER
     }
 
     public enum StatementType {

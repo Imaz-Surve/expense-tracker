@@ -1,14 +1,12 @@
 package com.imaz.expensetracker.repository;
 
 import com.imaz.expensetracker.entity.Transaction;
-import com.imaz.expensetracker.entity.Transaction.Category;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.LocalDate;
 import java.util.List;
-import java.util.Map;
 
 public interface TransactionRepository extends JpaRepository<Transaction, Long> {
 
@@ -17,16 +15,17 @@ public interface TransactionRepository extends JpaRepository<Transaction, Long> 
     List<Transaction> findByUserIdAndTransactionDateBetweenOrderByTransactionDateDesc(
             Long userId, LocalDate from, LocalDate to);
 
-    List<Transaction> findByUserIdAndCategoryOrderByTransactionDateDesc(
-            Long userId, Category category);
+    List<Transaction> findByUserIdAndCategoryIdOrderByTransactionDateDesc(
+            Long userId, Long categoryId);
 
     @Query("""
-        SELECT t.category AS category, SUM(t.amount) AS total
+        SELECT t.category.id AS categoryId, SUM(t.amount) AS total, COUNT(t) AS cnt
         FROM Transaction t
         WHERE t.user.id = :userId
           AND t.isDebit = true
           AND t.transactionDate BETWEEN :from AND :to
-        GROUP BY t.category
+          AND t.category IS NOT NULL
+        GROUP BY t.category.id
         ORDER BY total DESC
         """)
     List<Object[]> sumByCategory(
@@ -39,7 +38,7 @@ public interface TransactionRepository extends JpaRepository<Transaction, Long> 
                SUM(t.amount) AS total
         FROM Transaction t
         WHERE t.user.id = :userId AND t.isDebit = true
-        GROUP BY month
+        GROUP BY FUNCTION('DATE_FORMAT', t.transactionDate, '%Y-%m')
         ORDER BY month ASC
         """)
     List<Object[]> monthlySpending(@Param("userId") Long userId);

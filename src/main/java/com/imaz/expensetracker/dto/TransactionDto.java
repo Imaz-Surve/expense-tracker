@@ -1,6 +1,5 @@
 package com.imaz.expensetracker.dto;
 
-import com.imaz.expensetracker.entity.Transaction.Category;
 import com.imaz.expensetracker.entity.Transaction.StatementType;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -11,7 +10,6 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Map;
 
 public class TransactionDto {
 
@@ -25,7 +23,7 @@ public class TransactionDto {
         private String merchantName;
         private BigDecimal amount;
         private LocalDate transactionDate;
-        private Category category;
+        private CategoryDto category;
         private StatementType statementType;
         private Boolean isDebit;
         private LocalDateTime createdAt;
@@ -37,7 +35,7 @@ public class TransactionDto {
     @NoArgsConstructor
     @AllArgsConstructor
     public static class CategorySummary {
-        private Category category;
+        private CategoryDto category;
         private BigDecimal total;
         private Long count;
         private double percentage;
@@ -87,5 +85,86 @@ public class TransactionDto {
         private String fileName;
         private int parsedCount;
         private String message;
+    }
+
+    // ── Category DTOs ─────────────────────────────────────────────────────────
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class CategoryDto {
+        private Long id;
+        private String name;
+        private String slug;
+        private String color;
+        private String icon;
+        private Boolean isSystem;
+        private List<String> keywords;
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class CategoryRequest {
+        private String name;
+        private String color;
+        private String icon;
+        private List<String> keywords;
+    }
+
+    // ── Parse / Save flow ────────────────────────────────────────────────────
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class ParsedTransactionDto {
+        private String description;
+        private String merchantName;
+        private BigDecimal amount;
+        private LocalDate transactionDate;
+        private Boolean isDebit;
+        private Long suggestedCategoryId;
+    }
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class ParseResponse {
+        private String fileName;
+        private StatementType statementType;
+        private String monthYear;
+        private List<ParsedTransactionDto> parsed;
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class SaveTransactionItem {
+        private String description;
+        private String merchantName;
+        private BigDecimal amount;
+        private LocalDate transactionDate;
+        private Boolean isDebit;
+        private Long categoryId;
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class SaveStatementRequest {
+        private String fileName;
+        private StatementType statementType;
+        private String monthYear;
+        private List<SaveTransactionItem> transactions;
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class UpdateCategoryRequest {
+        private Long categoryId;
     }
 }

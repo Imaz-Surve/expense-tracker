@@ -1,11 +1,12 @@
 package com.imaz.expensetracker.parser;
 
-import com.imaz.expensetracker.entity.Transaction;
-import com.imaz.expensetracker.entity.Transaction.Category;
+import com.imaz.expensetracker.dto.TransactionDto.ParsedTransactionDto;
+import com.imaz.expensetracker.entity.Category;
 import com.imaz.expensetracker.entity.Transaction.StatementType;
+import com.imaz.expensetracker.service.CategoryService;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pdfbox.Loader;
-import org.apache.pdfbox.io.RandomAccessRead;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.springframework.stereotype.Service;
@@ -18,62 +19,17 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class StatementParserService {
 
-    private static final Map<Category, List<String>> CATEGORY_KEYWORDS = Map.of(
-            Category.FOOD_AND_DINING, List.of(
-                    "swiggy", "zomato", "uber eats", "restaurant", "cafe", "coffee",
-                    "hotel", "domino", "pizza", "burger", "kfc", "mcdonald", "subway",
-                    "biryani", "food", "dining", "dine", "eatery", "barbeque"
-            ),
-            Category.TRANSPORT, List.of(
-                    "uber", "ola", "rapido", "petrol", "fuel", "diesel", "metro",
-                    "irctc", "railway", "bus", "cab", "taxi", "parking", "toll",
-                    "redbus", "makemytrip flight", "indigo", "spicejet", "air india"
-            ),
-            Category.SHOPPING, List.of(
-                    "amazon", "flipkart", "myntra", "ajio", "nykaa", "meesho",
-                    "snapdeal", "tatacliq", "reliance", "zara", "h&m", "shopping",
-                    "mall", "retail", "store", "clothe"
-            ),
-            Category.UTILITIES, List.of(
-                    "electricity", "bescom", "mseb", "tneb", "water bill", "gas bill",
-                    "airtel", "jio", "vi ", "vodafone", "bsnl", "broadband", "wifi",
-                    "internet", "recharge", "postpaid", "prepaid", "mobile bill"
-            ),
-            Category.HEALTH, List.of(
-                    "pharmacy", "medplus", "apollo", "hospital", "clinic", "doctor",
-                    "medicine", "health", "pharmeasy", "1mg", "netmeds", "dental",
-                    "lab test", "diagnostic", "wellness"
-            ),
-            Category.ENTERTAINMENT, List.of(
-                    "netflix", "spotify", "prime video", "hotstar", "zee5", "sonyliv",
-                    "pvr", "inox", "bookmyshow", "gaming", "playstation", "xbox",
-                    "youtube premium", "gaana", "jiotv", "subscription"
-            ),
-            Category.TRAVEL, List.of(
-                    "makemytrip", "goibibo", "yatra", "cleartrip", "booking.com",
-                    "airbnb", "oyo", "hotel booking", "resort", "travel", "tour",
-                    "holiday", "vacation"
-            ),
-            Category.EDUCATION, List.of(
-                    "udemy", "coursera", "unacademy", "byjus", "school", "college",
-                    "university", "tuition", "education", "course", "training",
-                    "workshop", "seminar"
-            ),
-            Category.GROCERIES, List.of(
-                    "bigbasket", "grofers", "blinkit", "zepto", "dunzo", "instamart",
-                    "dmart", "supermarket", "grocery", "vegetables", "fruits", "kirana"
-            )
-    );
+    private final CategoryService categoryService;
 
-    // â”€â”€ Date patterns commonly found in Indian bank statements â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     private static final List<DateTimeFormatter> DATE_FORMATTERS = List.of(
             DateTimeFormatter.ofPattern("dd/MM/yyyy"),
             DateTimeFormatter.ofPattern("dd-MM-yyyy"),
@@ -83,124 +39,210 @@ public class StatementParserService {
             DateTimeFormatter.ofPattern("yyyy-MM-dd")
     );
 
-    // â”€â”€ Transaction line pattern: date + description + amount â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // Handles formats like: 12/03/2024  SWIGGY ORDER 12345  450.00  Dr
-    private static final Pattern TRANSACTION_PATTERN = Pattern.compile(
+    /**
+     * Handles HDFC-style credit-card lines like:
+     *   21/07/2026| 10:45   RAZ*CrunchyroliMumbai         ₹ 475.00
+     *   26/07/2026 | 00:00  1% Swiggy CashBack        + ₹ 7.75
+     *   04/08/2026| 18:07   MYNTRA DESIGNS PRIVATEBangalore ₹ 191.30
+     * Groups:
+     *   1: date  2: time  3: description  4: sign (+/- optional)  5: amount
+     */
+    private static final Pattern HDFC_LINE = Pattern.compile(
+            "^\\s*(\\d{2}[/\\-]\\d{2}[/\\-]\\d{2,4})\\s*[|/]?\\s*(\\d{1,2}:\\d{2})?\\s+" +
+                    "(.+?)\\s+" +
+                    "([+\\-])?\\s*(?:\\u20B9|Rs\\.?|INR)?\\s*" +
+                    "([\\d]{1,3}(?:,\\d{2,3})*(?:\\.\\d{2}))\\s*" +
+                    "(Dr|Cr|DR|CR|Debit|Credit)?\\s*$",
+            Pattern.UNICODE_CASE
+    );
+
+    /** Legacy pattern (kept as fallback for older statements). */
+    private static final Pattern LEGACY_LINE = Pattern.compile(
             "(?i)(\\d{2}[/\\-]\\d{2}[/\\-]\\d{2,4}|\\d{2}\\s+[A-Za-z]{3}\\s+\\d{4})" +
-                    "\\s+(.{5,60}?)\\s+" +
+                    "\\s+(.{5,80}?)\\s+" +
                     "(\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?)\\s*" +
                     "(Dr|Cr|DR|CR|Debit|Credit|D|C)?"
     );
 
-    public List<Transaction> parsePdf(MultipartFile file, StatementType statementType)
-            throws IOException {
+    /** Lines matching any of these are dropped as noise (case-insensitive). */
+    private static final List<String> NOISE_TOKENS = List.of(
+            "page ", "hsn code", "gstin", "opening balance", "closing balance",
+            "important information", "your card control", "purchase indicator",
+            "domestic transaction", "international transaction",
+            "previous statement", "payments/credits", "purchases/debit",
+            "total amount due", "minimum due", "credit limit", "cash limit",
+            "past dues", "over limit",
+            "cashback offer", "get vouchers", "get flat", "get ₹", "get rs",
+            "apply now", "click here", "know more", "check out", "get 50% discount",
+            "smartpay", "mycards", "swiggy hdfc bank credit card statement",
+            "rewards progress", "refer.", "share the benefits",
+            "domestic transactions"
+    );
+
+    public List<ParsedTransactionDto> parsePdf(MultipartFile file,
+                                                StatementType statementType,
+                                                Long userId) throws IOException {
 
         String rawText = extractText(file);
-        log.info("Extracted {} characters from PDF: {}", rawText.length(), file.getOriginalFilename());
+        log.info("Extracted {} chars from {}", rawText.length(), file.getOriginalFilename());
 
-        List<Transaction> transactions = extractTransactions(rawText, statementType);
-        log.info("Parsed {} transactions from {}", transactions.size(), file.getOriginalFilename());
-        return transactions;
+        List<String> lines = normalizeLines(rawText);
+
+        List<ParsedTransactionDto> primary = extract(lines, HDFC_LINE, true, userId);
+        if (primary.size() >= 3) {
+            log.info("Parsed {} transactions with HDFC pattern from {}", primary.size(), file.getOriginalFilename());
+            return primary;
+        }
+
+        List<ParsedTransactionDto> legacy = extract(lines, LEGACY_LINE, false, userId);
+        List<ParsedTransactionDto> best = legacy.size() > primary.size() ? legacy : primary;
+        log.info("Parsed {} transactions (best of HDFC={} / legacy={}) from {}",
+                best.size(), primary.size(), legacy.size(), file.getOriginalFilename());
+        return best;
     }
 
     private String extractText(MultipartFile file) throws IOException {
-        try (PDDocument document = Loader.loadPDF((RandomAccessRead) file.getInputStream())) {
-            //Loader PDDocument.load(file.getInputStream())
+        try (PDDocument document = Loader.loadPDF(file.getBytes())) {
             PDFTextStripper stripper = new PDFTextStripper();
             stripper.setSortByPosition(true);
             return stripper.getText(document);
         }
     }
 
-    private List<Transaction> extractTransactions(String text, StatementType statementType) {
-        List<Transaction> transactions = new ArrayList<>();
-        String[] lines = text.split("\\r?\\n");
+    /**
+     * Clean up raw text into candidate transaction lines. Also joins wrapped rows
+     * where the amount ended up on the next line.
+     */
+    private List<String> normalizeLines(String raw) {
+        String[] rawLines = raw.split("\\r?\\n");
+        List<String> out = new ArrayList<>(rawLines.length);
+        StringBuilder pending = null;
 
+        for (String orig : rawLines) {
+            String line = orig.replace('\u00A0', ' ').trim();
+            if (line.isEmpty()) { flush(pending, out); pending = null; continue; }
+            if (isNoise(line)) { flush(pending, out); pending = null; continue; }
+
+            // If line starts with a date, it's the start of a candidate row
+            boolean startsWithDate = line.matches("^\\d{2}[/\\-]\\d{2}[/\\-]\\d{2,4}.*");
+
+            if (startsWithDate) {
+                flush(pending, out);
+                pending = new StringBuilder(line);
+                // If the row is complete (has amount at end), flush immediately
+                if (endsWithAmount(line)) { out.add(pending.toString()); pending = null; }
+            } else if (pending != null) {
+                // Continuation: append until we see the amount tail
+                pending.append(' ').append(line);
+                if (endsWithAmount(pending.toString())) { out.add(pending.toString()); pending = null; }
+            } else {
+                // Non-transaction line — ignore
+            }
+        }
+        flush(pending, out);
+        return out;
+    }
+
+    private static void flush(StringBuilder sb, List<String> out) {
+        if (sb != null && sb.length() > 0) out.add(sb.toString());
+    }
+
+    private static boolean endsWithAmount(String line) {
+        return line.matches(".*[\\d,]+\\.\\d{2}\\s*(Dr|Cr|DR|CR|Debit|Credit)?\\s*$");
+    }
+
+    private boolean isNoise(String line) {
+        String lower = line.toLowerCase(Locale.ROOT);
+        for (String tok : NOISE_TOKENS) {
+            if (lower.contains(tok)) return true;
+        }
+        return false;
+    }
+
+    private List<ParsedTransactionDto> extract(List<String> lines, Pattern pattern,
+                                               boolean hdfc, Long userId) {
+        List<ParsedTransactionDto> transactions = new ArrayList<>();
         for (String line : lines) {
-            line = line.trim();
-            if (line.isBlank() || line.length() < 10) continue;
+            Matcher m = pattern.matcher(line);
+            if (!m.find()) continue;
+            try {
+                LocalDate date;
+                String description;
+                BigDecimal amount;
+                boolean isDebit;
 
-            Matcher m = TRANSACTION_PATTERN.matcher(line);
-            if (m.find()) {
-                try {
-                    LocalDate date = parseDate(m.group(1));
+                if (hdfc) {
+                    date = parseDate(m.group(1));
                     if (date == null) continue;
-
-                    String description = m.group(2).trim();
-                    BigDecimal amount = parseAmount(m.group(3));
-                    boolean isDebit = determineDebit(m.group(4), description);
-
-                    // Skip credits (income) â€” only track expenses
-                    if (!isDebit) continue;
-
-                    Category category = categorize(description);
-
-                    Transaction tx = Transaction.builder()
-                            .description(description)
-                            .merchantName(extractMerchantName(description))
-                            .amount(amount)
-                            .transactionDate(date)
-                            .category(category)
-                            .statementType(statementType)
-                            .isDebit(true)
-                            .build();
-
-                    transactions.add(tx);
-                } catch (Exception e) {
-                    log.debug("Could not parse line: {}", line);
+                    description = m.group(3).trim();
+                    String sign = m.group(4);
+                    amount = parseAmount(m.group(5));
+                    String flag = m.group(6);
+                    // Credit-card statement: `+` prefix denotes cashback / credit.
+                    // Trailing "Cr" also = credit. Everything else = debit (spend).
+                    boolean isCredit = "+".equals(sign)
+                            || (flag != null && flag.toUpperCase(Locale.ROOT).startsWith("C"));
+                    isDebit = !isCredit;
+                } else {
+                    date = parseDate(m.group(1));
+                    if (date == null) continue;
+                    description = m.group(2).trim();
+                    amount = parseAmount(m.group(3));
+                    isDebit = determineDebit(m.group(4), description);
                 }
+
+                if (description.isBlank() || amount.signum() == 0) continue;
+                // Drop obvious non-transactions (e.g. summary rows like "Total")
+                if (description.toLowerCase(Locale.ROOT).matches(".*(total|balance|opening|closing).*")) continue;
+
+                Category suggested = categoryService.suggest(description, userId);
+
+                transactions.add(ParsedTransactionDto.builder()
+                        .description(description)
+                        .merchantName(extractMerchantName(description))
+                        .amount(amount)
+                        .transactionDate(date)
+                        .isDebit(isDebit)
+                        .suggestedCategoryId(suggested == null ? null : suggested.getId())
+                        .build());
+            } catch (Exception e) {
+                log.debug("Could not parse line: {} — {}", line, e.getMessage());
             }
         }
         return transactions;
     }
 
-    public Category categorize(String description) {
-        String lower = description.toLowerCase();
-        for (Map.Entry<Category, List<String>> entry : CATEGORY_KEYWORDS.entrySet()) {
-            for (String keyword : entry.getValue()) {
-                if (lower.contains(keyword)) {
-                    return entry.getKey();
-                }
-            }
-        }
-        return Category.OTHER;
-    }
-
     private LocalDate parseDate(String dateStr) {
-        dateStr = dateStr.trim();
+        String s = dateStr.trim();
         for (DateTimeFormatter fmt : DATE_FORMATTERS) {
-            try {
-                return LocalDate.parse(dateStr, fmt);
-            } catch (DateTimeParseException ignored) {}
+            try { return LocalDate.parse(s, fmt); } catch (DateTimeParseException ignored) {}
         }
         return null;
     }
 
     private BigDecimal parseAmount(String amountStr) {
-        if (amountStr == null) return BigDecimal.ZERO;
         return new BigDecimal(amountStr.replace(",", ""));
     }
 
     private boolean determineDebit(String drCrFlag, String description) {
-        if (drCrFlag != null) {
-            String flag = drCrFlag.toUpperCase();
-            return flag.startsWith("D");
-        }
-        // Heuristic: if description contains credit-like words, treat as credit
-        String lower = description.toLowerCase();
+        if (drCrFlag != null) return drCrFlag.toUpperCase(Locale.ROOT).startsWith("D");
+        String lower = description.toLowerCase(Locale.ROOT);
         return !(lower.contains("credit") || lower.contains("refund")
                 || lower.contains("cashback") || lower.contains("reversal"));
     }
 
     private String extractMerchantName(String description) {
-        // Take first 2-3 words as merchant name
-        String[] parts = description.split("\\s+");
-        int wordCount = Math.min(parts.length, 3);
+        // Take the first "word block" after stripping common prefixes / tokens
+        String cleaned = description
+                .replaceAll("(?i)^(upi|neft|imps|pos|atm|raz\\*|pay[a-z]*\\s*)+", "")
+                .trim();
+        String[] parts = cleaned.split("[\\s\\*/|-]+");
+        if (parts.length == 0) return description;
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < wordCount; i++) {
-            if (i > 0) sb.append(" ");
+        for (int i = 0; i < Math.min(parts.length, 3); i++) {
+            if (i > 0) sb.append(' ');
             sb.append(parts[i]);
         }
-        return sb.toString().toUpperCase();
+        return sb.toString();
     }
 }

@@ -1,11 +1,12 @@
 package com.imaz.expensetracker.service;
 
 import com.imaz.expensetracker.dto.TransactionDto.*;
+import com.imaz.expensetracker.entity.Category;
 import com.imaz.expensetracker.entity.Statement;
 import com.imaz.expensetracker.entity.Transaction;
-import com.imaz.expensetracker.entity.Transaction.Category;
 import com.imaz.expensetracker.entity.User;
 import com.imaz.expensetracker.parser.StatementParserService;
+import com.imaz.expensetracker.repository.CategoryRepository;
 import com.imaz.expensetracker.repository.StatementRepository;
 import com.imaz.expensetracker.repository.TransactionRepository;
 import com.imaz.expensetracker.repository.UserRepository;
@@ -19,8 +20,10 @@ import org.springframework.web.multipart.MultipartFile;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -31,44 +34,96 @@ public class TransactionService {
     private final TransactionRepository transactionRepo;
     private final StatementRepository statementRepo;
     private final UserRepository userRepo;
+    private final CategoryRepository categoryRepo;
+    private final CategoryService categoryService;
     private final StatementParserService parserService;
 
-    @Transactional
-    public UploadResponse uploadStatement(MultipartFile file,
-                                          Transaction.StatementType statementType,
-                                          String monthYear) throws Exception {
+    // ── Parse (no persist) ────────────────────────────────────────────────────
+    public ParseResponse parseStatement(MultipartFile file,
+                                        Transaction.StatementType statementType,
+                                        String monthYear) throws Exception {
         User user = currentUser();
-
-        // Parse PDF
-        List<Transaction> parsed = parserService.parsePdf(file, statementType);
-
-        // Save statement record
-        Statement statement = Statement.builder()
+        List<ParsedTransactionDto> parsed = parserService.parsePdf(file, statementType, user.getId());
+        return ParseResponse.builder()
                 .fileName(file.getOriginalFilename())
                 .statementType(statementType)
                 .monthYear(monthYear)
-                .transactionCount(parsed.size())
+                .parsed(parsed)
+                .build();
+    }
+
+    // ── Save reviewed transactions ────────────────────────────────────────────
+    @Transactional
+    public UploadResponse saveStatement(SaveStatementRequest req) {
+        User user = currentUser();
+        if (req.getTransactions() == null || req.getTransactions().isEmpty()) {
+            throw new IllegalArgumentException("No transactions to save");
+        }
+
+        Statement statement = Statement.builder()
+                .fileName(req.getFileName())
+                .statementType(req.getStatementType())
+                .monthYear(req.getMonthYear())
+                .transactionCount(req.getTransactions().size())
                 .user(user)
                 .build();
         statementRepo.save(statement);
 
-        // Attach user and statement to each transaction, then save
-        parsed.forEach(tx -> {
-            tx.setUser(user);
-            tx.setStatement(statement);
-        });
-        transactionRepo.saveAll(parsed);
+        // Preload categories used in this batch
+        Map<Long, Category> catCache = new HashMap<>();
+        for (SaveTransactionItem it : req.getTransactions()) {
+            if (it.getCategoryId() != null && !catCache.containsKey(it.getCategoryId())) {
+                Category c = categoryRepo.findByIdAndUserId(it.getCategoryId(), user.getId())
+                        .orElseThrow(() -> new IllegalArgumentException(
+                                "Category " + it.getCategoryId() + " not found"));
+                catCache.put(c.getId(), c);
+            }
+        }
+
+        List<Transaction> txs = new ArrayList<>(req.getTransactions().size());
+        for (SaveTransactionItem it : req.getTransactions()) {
+            txs.add(Transaction.builder()
+                    .description(it.getDescription())
+                    .merchantName(it.getMerchantName())
+                    .amount(it.getAmount())
+                    .transactionDate(it.getTransactionDate())
+                    .isDebit(it.getIsDebit() == null ? true : it.getIsDebit())
+                    .category(it.getCategoryId() == null ? null : catCache.get(it.getCategoryId()))
+                    .statementType(req.getStatementType())
+                    .user(user)
+                    .statement(statement)
+                    .build());
+        }
+        transactionRepo.saveAll(txs);
 
         return UploadResponse.builder()
                 .statementId(statement.getId())
-                .fileName(file.getOriginalFilename())
-                .parsedCount(parsed.size())
-                .message("Successfully parsed " + parsed.size() + " transactions")
+                .fileName(req.getFileName())
+                .parsedCount(txs.size())
+                .message("Saved " + txs.size() + " transactions")
                 .build();
     }
 
-    // â”€â”€ Dashboard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Inline category edit ──────────────────────────────────────────────────
+    @Transactional
+    public TransactionResponse updateCategory(Long transactionId, Long categoryId) {
+        User user = currentUser();
+        Transaction tx = transactionRepo.findById(transactionId)
+                .orElseThrow(() -> new IllegalArgumentException("Transaction not found"));
+        if (!tx.getUser().getId().equals(user.getId())) {
+            throw new SecurityException("Access denied");
+        }
+        if (categoryId == null) {
+            tx.setCategory(null);
+        } else {
+            Category c = categoryRepo.findByIdAndUserId(categoryId, user.getId())
+                    .orElseThrow(() -> new IllegalArgumentException("Category not found"));
+            tx.setCategory(c);
+        }
+        return toResponse(transactionRepo.save(tx));
+    }
 
+    // ── Dashboard ─────────────────────────────────────────────────────────────
     public DashboardResponse getDashboard() {
         User user = currentUser();
         Long userId = user.getId();
@@ -76,28 +131,22 @@ public class TransactionService {
         LocalDate now = LocalDate.now();
         LocalDate startOfMonth = now.withDayOfMonth(1);
 
-        // This month spending
         List<Transaction> monthTxs = transactionRepo
-                .findByUserIdAndTransactionDateBetweenOrderByTransactionDateDesc(
-                        userId, startOfMonth, now);
+                .findByUserIdAndTransactionDateBetweenOrderByTransactionDateDesc(userId, startOfMonth, now);
         BigDecimal thisMonth = monthTxs.stream()
                 .filter(Transaction::getIsDebit)
                 .map(Transaction::getAmount)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        // All-time total
-        List<Transaction> allTxs = transactionRepo
-                .findByUserIdOrderByTransactionDateDesc(userId);
+        List<Transaction> allTxs = transactionRepo.findByUserIdOrderByTransactionDateDesc(userId);
         BigDecimal allTime = allTxs.stream()
                 .filter(Transaction::getIsDebit)
                 .map(Transaction::getAmount)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        // Category breakdown (this month)
         List<Object[]> rawCategories = transactionRepo.sumByCategory(userId, startOfMonth, now);
-        List<CategorySummary> categories = buildCategorySummaries(rawCategories, thisMonth);
+        List<CategorySummary> categories = buildCategorySummaries(rawCategories, thisMonth, userId);
 
-        // Monthly trend
         List<Object[]> rawMonthly = transactionRepo.monthlySpending(userId);
         List<MonthlySummary> monthly = rawMonthly.stream()
                 .map(row -> MonthlySummary.builder()
@@ -106,7 +155,6 @@ public class TransactionService {
                         .build())
                 .collect(Collectors.toList());
 
-        // Recent 10 transactions
         List<TransactionResponse> recent = allTxs.stream()
                 .limit(10)
                 .map(this::toResponse)
@@ -122,25 +170,21 @@ public class TransactionService {
                 .build();
     }
 
-    // â”€â”€ Transactions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-    public List<TransactionResponse> getTransactions(String from, String to, Category category) {
+    // ── Transactions listing ──────────────────────────────────────────────────
+    public List<TransactionResponse> getTransactions(String from, String to, Long categoryId) {
         User user = currentUser();
         List<Transaction> txs;
 
-        if (category != null) {
-            txs = transactionRepo.findByUserIdAndCategoryOrderByTransactionDateDesc(
-                    user.getId(), category);
+        if (categoryId != null) {
+            txs = transactionRepo.findByUserIdAndCategoryIdOrderByTransactionDateDesc(user.getId(), categoryId);
         } else if (from != null && to != null) {
             LocalDate fromDate = LocalDate.parse(from);
             LocalDate toDate = LocalDate.parse(to);
             txs = transactionRepo
-                    .findByUserIdAndTransactionDateBetweenOrderByTransactionDateDesc(
-                            user.getId(), fromDate, toDate);
+                    .findByUserIdAndTransactionDateBetweenOrderByTransactionDateDesc(user.getId(), fromDate, toDate);
         } else {
             txs = transactionRepo.findByUserIdOrderByTransactionDateDesc(user.getId());
         }
-
         return txs.stream().map(this::toResponse).collect(Collectors.toList());
     }
 
@@ -158,24 +202,35 @@ public class TransactionService {
         if (!statement.getUser().getId().equals(user.getId())) {
             throw new SecurityException("Access denied");
         }
+        // Explicitly delete child transactions first (Statement's OneToMany may be lazy-empty)
+        List<Transaction> txs = transactionRepo.findByStatementId(statementId);
+        transactionRepo.deleteAll(txs);
         statementRepo.delete(statement);
     }
 
-    // â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Helpers ──────────────────────────────────────────────────────────────
 
-    private List<CategorySummary> buildCategorySummaries(List<Object[]> raw, BigDecimal total) {
-        if (total.compareTo(BigDecimal.ZERO) == 0) return List.of();
-        return raw.stream().map(row -> {
-            Category cat = Category.valueOf((String) row[0]);
+    private List<CategorySummary> buildCategorySummaries(List<Object[]> raw, BigDecimal total, Long userId) {
+        if (total.compareTo(BigDecimal.ZERO) == 0 || raw.isEmpty()) return List.of();
+        Map<Long, Category> byId = categoryRepo.findByUserIdOrderByNameAsc(userId).stream()
+                .collect(Collectors.toMap(Category::getId, c -> c));
+        List<CategorySummary> out = new ArrayList<>(raw.size());
+        for (Object[] row : raw) {
+            Long catId = ((Number) row[0]).longValue();
             BigDecimal catTotal = BigDecimal.valueOf(((Number) row[1]).doubleValue());
+            Long count = ((Number) row[2]).longValue();
             double pct = catTotal.divide(total, 4, RoundingMode.HALF_UP)
                     .multiply(BigDecimal.valueOf(100)).doubleValue();
-            return CategorySummary.builder()
-                    .category(cat)
+            Category c = byId.get(catId);
+            if (c == null) continue;
+            out.add(CategorySummary.builder()
+                    .category(categoryService.toDto(c))
                     .total(catTotal)
+                    .count(count)
                     .percentage(pct)
-                    .build();
-        }).collect(Collectors.toList());
+                    .build());
+        }
+        return out;
     }
 
     private TransactionResponse toResponse(Transaction tx) {
@@ -185,7 +240,7 @@ public class TransactionService {
                 .merchantName(tx.getMerchantName())
                 .amount(tx.getAmount())
                 .transactionDate(tx.getTransactionDate())
-                .category(tx.getCategory())
+                .category(tx.getCategory() == null ? null : categoryService.toDto(tx.getCategory()))
                 .statementType(tx.getStatementType())
                 .isDebit(tx.getIsDebit())
                 .createdAt(tx.getCreatedAt())
@@ -205,8 +260,7 @@ public class TransactionService {
     }
 
     private User currentUser() {
-        String email = SecurityContextHolder.getContext()
-                .getAuthentication().getName();
+        String email = SecurityContextHolder.getContext().getAuthentication().getName();
         return userRepo.findByEmail(email)
                 .orElseThrow(() -> new IllegalStateException("User not found"));
     }
